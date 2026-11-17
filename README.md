@@ -92,7 +92,7 @@ Cluster_Analysis/
 │
 └── README.md
 ```
-7. Limitations
+## 7. Limitations
 Several limitations should be considered:
 1. Fixed BMI cutoffs do not account for age- and sex-specific growth patterns in adolescents.
 2. Dietary intake is based on a single 24-hour recall and may not represent usual dietary habits.
@@ -101,13 +101,13 @@ Several limitations should be considered:
 5. Feature selection is performed before cross-validation, which may introduce selection uncertainty.
 6. NHANES complex survey design features, including sampling weights, strata, and primary sampling units, are not incorporated into the classification analysis.
 7. The classification models show limited ability to distinguish among the four BMI categories.
-8. Conclusion
+## 8. Conclusion
 Dietary variables alone provide limited predictive information for classifying BMI categories among adolescents in this analysis. While kNN performs better in terms of Macro-F1, neither model demonstrates satisfactory classification performance.
 
 Future studies could incorporate age- and sex-specific BMI percentiles, additional lifestyle and socioeconomic variables, and more representative dietary measurements to improve classification performance.
-9. Data Source
+## 9. Data Source
 National Health and Nutrition Examination Survey (NHANES), August 2021–August 2023.
 
 https://www.cdc.gov/nchs/nhanes/
 
-The content is totally generate from ChatGPT
+### The content is totally generate from ChatGPT
