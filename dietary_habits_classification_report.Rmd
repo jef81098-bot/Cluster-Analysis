@@ -1,0 +1,1142 @@
+
+---
+title: "Classification of Dietary Habits and Obesity Status"
+author: "Wang Ching-Cheng"
+date: "`r Sys.Date()`"
+subtitle: "NHANES August 2021–August 2023"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = "#>"
+)
+
+library(haven)
+library(tree)
+
+set.seed(123)
+
+if (!dir.exists("output")) {
+  dir.create("output")
+}
+```
+
+# Introduction
+
+This assignment examines whether dietary intake variables can be used to classify the BMI category of adolescents aged 12–18 years. The analysis uses dietary recall, demographic, and body-measurement data from the National Health and Nutrition Examination Survey (NHANES), August 2021–August 2023.
+
+Two classification approaches are compared: k-nearest neighbors (kNN) and a classification tree. The outcome is a four-level BMI category, while dietary intake variables are used as predictors.
+
+The purpose of this analysis is to evaluate predictive performance rather than to establish a causal relationship between dietary intake and obesity.
+
+# Data source and study population
+
+## Data source
+
+Three NHANES datasets are used:
+
+- `DR1TOT_L.xpt`: Day 1 total nutrient intake.
+- `DEMO_L.xpt`: Demographic information, including age.
+- `BMX_L.xpt`: Body measurements, including BMI.
+
+The datasets are merged using the participant identifier `SEQN`.
+
+The following code imports the datasets and selects the variables required for the analysis.
+
+```{r load-data}
+diet <- read_xpt("DR1TOT_L.xpt")
+demo <- read_xpt("DEMO_L.xpt")
+bmx  <- read_xpt("BMX_L.xpt")
+
+diet_vars <- c(
+  "SEQN", "DR1DRSTZ", "DR1TKCAL",
+  "DR1TPROT", "DR1TCARB", "DR1TSUGR",
+  "DR1TFIBE", "DR1TTFAT", "DR1TCHOL",
+  "DR1TATOC", "DR1TVARA", "DR1TVB1",
+  "DR1TVB2", "DR1TVB6", "DR1TVB12",
+  "DR1TVC", "DR1TVD", "DR1TCAFF",
+  "DR1TALCO", "DR1_320Z"
+)
+
+demo_vars <- c("SEQN", "RIDAGEYR")
+bmx_vars  <- c("SEQN", "BMXBMI")
+
+stopifnot(all(diet_vars %in% names(diet)))
+stopifnot(all(demo_vars %in% names(demo)))
+stopifnot(all(bmx_vars %in% names(bmx)))
+
+diet <- diet[, diet_vars]
+demo <- demo[, demo_vars]
+bmx  <- bmx[, bmx_vars]
+
+data <- merge(diet, demo, by = "SEQN")
+data <- merge(data, bmx, by = "SEQN")
+
+dim(data)
+```
+
+## Study population selection
+
+The analytic sample is restricted to participants who meet all of the following criteria:
+
+1. Aged 12–18 years.
+2. Have a reliable Day 1 dietary recall (`DR1DRSTZ == 1`).
+3. Have a non-missing BMI.
+4. Have a valid positive energy intake.
+
+The following code applies the inclusion criteria.
+
+```{r sample-selection}
+data <- data[
+  data$RIDAGEYR >= 12 &
+    data$RIDAGEYR <= 18 &
+    data$DR1DRSTZ == 1 &
+    !is.na(data$BMXBMI) &
+    !is.na(data$DR1TKCAL) &
+    data$DR1TKCAL > 0,
+]
+
+rownames(data) <- NULL
+
+cat("Number of observations:", nrow(data), "\n")
+```
+
+The resulting sample size is displayed above. This sample is used for all subsequent analyses.
+
+# Outcome and predictor variables
+
+## Outcome variable: BMI category
+
+The outcome variable is `BMI_category`, constructed from measured BMI (`BMXBMI`) using the following operational cut points:
+
+| Category | BMI range (kg/m²) |
+|---|---:|
+| Underweight | BMI < 18.5 |
+| Normal | 18.5 ≤ BMI < 24 |
+| Overweight | 24 ≤ BMI < 27 |
+| Obesity | BMI ≥ 27 |
+
+These are the cut points used in this assignment. They are not age- and sex-specific pediatric BMI-for-age percentiles. This distinction is important when interpreting the classification outcome for adolescents.
+
+```{r bmi-category}
+data$BMI_category <- cut(
+  data$BMXBMI,
+  breaks = c(-Inf, 18.5, 24, 27, Inf),
+  labels = c(
+    "Underweight",
+    "Normal",
+    "Overweight",
+    "Obesity"
+  ),
+  right = FALSE
+)
+
+data$BMI_category <- factor(
+  data$BMI_category,
+  levels = c(
+    "Underweight",
+    "Normal",
+    "Overweight",
+    "Obesity"
+  )
+)
+
+data <- data[!is.na(data$BMI_category), ]
+
+cat("Number of observations:", nrow(data), "\n")
+```
+
+The distribution of BMI categories is examined to understand the outcome composition.
+
+```{r bmi-distribution}
+bmi_distribution <- table(data$BMI_category)
+
+print(bmi_distribution)
+
+write.csv(
+  as.data.frame(bmi_distribution),
+  "output/BMI_distribution.csv",
+  row.names = FALSE
+)
+```
+
+The class distribution is important because an imbalanced outcome may affect classification performance. Stratified sampling and macro-averaged evaluation metrics are therefore used in the subsequent analysis.
+
+## Dietary predictor variables
+
+The following English names are used for the model predictors. Nutrient variables, except total energy, caffeine, alcohol, and plain water, are converted to intake density per 1,000 kcal before transformation.
+
+| Dietary variable | Model variable name | Original NHANES variable |
+|---|---|---|
+| Energy (kcal) | `energy_kcal` | `DR1TKCAL` |
+| Protein (gm) | `protein_g_per_1000kcal` | `DR1TPROT` |
+| Carbohydrate (gm) | `carbohydrate_g_per_1000kcal` | `DR1TCARB` |
+| Total sugars (gm) | `total_sugars_g_per_1000kcal` | `DR1TSUGR` |
+| Dietary fiber (gm) | `dietary_fiber_g_per_1000kcal` | `DR1TFIBE` |
+| Total fat (gm) | `total_fat_g_per_1000kcal` | `DR1TTFAT` |
+| Cholesterol (mg) | `cholesterol_mg_per_1000kcal` | `DR1TCHOL` |
+| Vitamin E as alpha-tocopherol (mg) | `vitamin_e_alpha_tocopherol_mg_per_1000kcal` | `DR1TATOC` |
+| Vitamin A, RAE (mcg) | `vitamin_a_rae_mcg_per_1000kcal` | `DR1TVARA` |
+| Thiamin (Vitamin B1) | `thiamin_vitamin_b1_mg_per_1000kcal` | `DR1TVB1` |
+| Riboflavin (Vitamin B2) | `riboflavin_vitamin_b2_mg_per_1000kcal` | `DR1TVB2` |
+| Vitamin B6 (mg) | `vitamin_b6_mg_per_1000kcal` | `DR1TVB6` |
+| Vitamin B12 (mcg) | `vitamin_b12_mcg_per_1000kcal` | `DR1TVB12` |
+| Vitamin C (mg) | `vitamin_c_mg_per_1000kcal` | `DR1TVC` |
+| Vitamin D (D2 + D3) (mcg) | `vitamin_d_d2_d3_mcg_per_1000kcal` | `DR1TVD` |
+| Caffeine (mg) | `caffeine_mg` | `DR1TCAFF` |
+| Alcohol (gm) | `alcohol_g` | `DR1TALCO` |
+| Total plain water drank yesterday (gm) | `total_plain_water_g` | `DR1_320Z` |
+
+## Feature engineering
+
+Nutrient density is calculated as:
+
+\[
+\text{Nutrient density}
+=
+\frac{\text{nutrient intake}}
+{\text{energy intake}/1000}
+\]
+
+This approach expresses nutrient intake relative to total energy intake.
+
+A `log(1 + x)` transformation is applied to energy, nutrient densities, caffeine, alcohol, and plain water. This transformation reduces right-skewness and limits the influence of very large values.
+
+```{r feature-engineering}
+x <- data.frame(
+  energy_kcal = log1p(data$DR1TKCAL)
+)
+
+nutrient_name_map <- c(
+  DR1TPROT = "protein_g_per_1000kcal",
+  DR1TCARB = "carbohydrate_g_per_1000kcal",
+  DR1TSUGR = "total_sugars_g_per_1000kcal",
+  DR1TFIBE = "dietary_fiber_g_per_1000kcal",
+  DR1TTFAT = "total_fat_g_per_1000kcal",
+  DR1TCHOL = "cholesterol_mg_per_1000kcal",
+  DR1TATOC = "vitamin_e_alpha_tocopherol_mg_per_1000kcal",
+  DR1TVARA = "vitamin_a_rae_mcg_per_1000kcal",
+  DR1TVB1 = "thiamin_vitamin_b1_mg_per_1000kcal",
+  DR1TVB2 = "riboflavin_vitamin_b2_mg_per_1000kcal",
+  DR1TVB6 = "vitamin_b6_mg_per_1000kcal",
+  DR1TVB12 = "vitamin_b12_mcg_per_1000kcal",
+  DR1TVC = "vitamin_c_mg_per_1000kcal",
+  DR1TVD = "vitamin_d_d2_d3_mcg_per_1000kcal"
+)
+
+for (source_var in names(nutrient_name_map)) {
+
+  nutrient_density <- data[[source_var]] /
+    (data$DR1TKCAL / 1000)
+
+  model_var_name <- unname(nutrient_name_map[source_var])
+
+  x[[model_var_name]] <- log1p(nutrient_density)
+}
+
+x$caffeine_mg <- log1p(data$DR1TCAFF)
+x$alcohol_g <- log1p(data$DR1TALCO)
+x$total_plain_water_g <- log1p(data$DR1_320Z)
+
+y <- data$BMI_category
+
+summary(x)
+```
+
+The resulting dataset contains the transformed dietary predictors and the BMI category outcome. These predictors are used in the feature-selection process.
+
+# Data preprocessing and feature selection
+
+## Train-test split
+
+The data are divided into training and testing sets using a stratified split. Within each BMI category, approximately 70% of observations are assigned to the training set and the remaining 30% to the testing set.
+
+Stratification is intended to preserve the class proportions in both datasets.
+
+```{r train-test-split}
+set.seed(123)
+
+train_index <- unlist(
+  lapply(levels(y), function(class_name) {
+
+    idx <- which(y == class_name)
+
+    n_train <- floor(length(idx) * 0.7)
+
+    sample(idx, size = n_train)
+  })
+)
+
+train_index <- sort(train_index)
+test_index <- setdiff(seq_len(nrow(x)), train_index)
+
+x_train <- x[train_index, , drop = FALSE]
+x_test  <- x[test_index, , drop = FALSE]
+
+y_train <- droplevels(y[train_index])
+
+y_test <- factor(
+  y[test_index],
+  levels = levels(y)
+)
+
+cat("Training set:\n")
+print(table(y_train))
+
+cat("\nTesting set:\n")
+print(table(y_test))
+```
+
+The training set is used for feature selection and model construction. The testing set is reserved for the final evaluation of predictive performance.
+
+## Missing-value imputation
+
+Missing predictor values are replaced with the median of the corresponding variable in the training data. The training-set median is also applied to the test data.
+
+This prevents information from the test set from being used to calculate imputation values.
+
+```{r imputation-function}
+impute_median <- function(train_x, new_x) {
+
+  medians <- sapply(
+    train_x,
+    median,
+    na.rm = TRUE
+  )
+
+  medians[!is.finite(medians)] <- 0
+
+  for (v in names(train_x)) {
+
+    train_x[[v]][is.na(train_x[[v]])] <- medians[v]
+
+    new_x[[v]][is.na(new_x[[v]])] <- medians[v]
+  }
+
+  list(
+    train = train_x,
+    new = new_x
+  )
+}
+
+imp_fs <- impute_median(x_train, x_test)
+
+x_train <- imp_fs$train
+x_test <- imp_fs$new
+```
+
+## Variance filtering
+
+Variables with non-finite variance or variance less than or equal to \(10^{-8}\) are removed.
+
+A variable with almost no variation contributes little information for distinguishing outcome categories and may cause computational problems in later steps.
+
+```{r variance-filtering}
+feature_var <- sapply(x_train, var)
+
+variance_table <- data.frame(
+  Variable = names(feature_var),
+  Variance = as.numeric(feature_var)
+)
+
+keep_vars <- names(feature_var)[
+  is.finite(feature_var) &
+    feature_var > 1e-8
+]
+
+cat("Variables before filtering:", ncol(x_train), "\n")
+cat("Variables after variance filtering:", length(keep_vars), "\n")
+
+print(variance_table)
+
+write.csv(
+  variance_table,
+  "output/feature_variance.csv",
+  row.names = FALSE
+)
+```
+
+The variance filter removes predictors with insufficient variation before statistical screening.
+
+## Kruskal–Wallis screening
+
+For each remaining predictor, a Kruskal–Wallis test is used to assess whether its distribution differs across the four BMI categories in the training data.
+
+This non-parametric test is used because it does not require the predictor values to follow a normal distribution.
+
+The Benjamini–Hochberg procedure is applied to the p-values to control the false discovery rate (FDR). Variables with FDR below 0.10 are preferred.
+
+```{r kruskal-wallis}
+kw_results <- data.frame(
+  Variable = keep_vars,
+  P_value = NA_real_
+)
+
+for (i in seq_along(keep_vars)) {
+
+  v <- keep_vars[i]
+
+  test <- kruskal.test(
+    x_train[[v]] ~ y_train
+  )
+
+  kw_results$P_value[i] <- test$p.value
+}
+
+kw_results$FDR <- p.adjust(
+  kw_results$P_value,
+  method = "BH"
+)
+
+kw_results <- kw_results[
+  order(kw_results$P_value),
+]
+
+print(kw_results)
+
+write.csv(
+  kw_results,
+  "output/feature_selection_kruskal.csv",
+  row.names = FALSE
+)
+```
+
+The p-values indicate whether the distributions of individual predictors differ across BMI categories. The FDR-adjusted values account for multiple statistical tests.
+
+## Correlation filtering
+
+To reduce redundancy among predictors, the absolute pairwise Pearson correlation is examined.
+
+Predictors are considered in ascending order of their Kruskal–Wallis p-values. A variable is retained only if its absolute correlation with every already-selected variable is below 0.85.
+
+```{r correlation-filtering}
+cor_matrix <- cor(
+  x_train[, keep_vars, drop = FALSE],
+  use = "complete.obs"
+)
+
+ranked_vars <- kw_results$Variable
+
+selected_vars <- character(0)
+
+for (v in ranked_vars) {
+
+  if (length(selected_vars) == 0) {
+
+    selected_vars <- c(selected_vars, v)
+
+  } else {
+
+    correlations <- abs(
+      cor_matrix[v, selected_vars]
+    )
+
+    if (all(correlations < 0.85)) {
+      selected_vars <- c(selected_vars, v)
+    }
+  }
+}
+
+cat(
+  "Variables after correlation filtering:",
+  length(selected_vars),
+  "\n"
+)
+```
+
+This procedure reduces the inclusion of highly correlated predictors, helping to limit redundant information in the models.
+
+## Final feature selection
+
+After correlation filtering, variables with FDR below 0.10 are retained.
+
+If fewer than five variables meet this criterion, the five highest-ranked available variables are retained instead. The final number of predictors is limited to ten.
+
+```{r final-feature-selection}
+final_vars <- selected_vars[
+  kw_results$FDR[
+    match(selected_vars, kw_results$Variable)
+  ] < 0.10
+]
+
+if (length(final_vars) < 5) {
+  final_vars <- head(selected_vars, 5)
+}
+
+if (length(final_vars) > 10) {
+  final_vars <- head(final_vars, 10)
+}
+
+cat("Selected predictors:\n")
+print(final_vars)
+
+cat(
+  "Number of selected predictors:",
+  length(final_vars),
+  "\n"
+)
+
+write.csv(
+  data.frame(Selected_Variable = final_vars),
+  "output/selected_features.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  cor_matrix,
+  "output/feature_selection_correlation.csv"
+)
+```
+
+The selected predictors are then used in both classification models.
+
+```{r apply-selected-features}
+x_train <- x_train[
+  , final_vars, drop = FALSE
+]
+
+x_test <- x_test[
+  , final_vars, drop = FALSE
+]
+
+cat("Final training predictor dimensions:\n")
+print(dim(x_train))
+
+cat("Final testing predictor dimensions:\n")
+print(dim(x_test))
+```
+
+The feature-selection procedure is conducted using the training data only. The selected variables are subsequently applied to both training and testing datasets.
+
+# Model construction and evaluation
+
+## Evaluation metrics
+
+The following metrics are calculated from the test-set confusion matrix:
+
+- **Accuracy:** Proportion of all test observations classified correctly.
+- **Macro-precision:** Arithmetic mean of the class-specific precision values.
+- **Macro-recall:** Arithmetic mean of the class-specific recall values.
+- **Macro-F1:** Arithmetic mean of the class-specific F1 scores.
+- **Balanced accuracy:** Calculated here as the mean class-specific recall, equivalent to Macro-recall in this multiclass setting.
+
+Macro-averaged measures give each BMI category equal weight, which is useful when class frequencies differ.
+
+The following function calculates these evaluation metrics.
+
+```{r evaluation-function}
+evaluate_model <- function(pred, actual) {
+
+  class_names <- levels(actual)
+
+  pred <- factor(pred, levels = class_names)
+  actual <- factor(actual, levels = class_names)
+
+  cm <- table(
+    Predicted = pred,
+    Actual = actual
+  )
+
+  accuracy <- sum(diag(cm)) / sum(cm)
+
+  precision <- numeric(length(class_names))
+  recall <- numeric(length(class_names))
+  f1 <- numeric(length(class_names))
+
+  for (i in seq_along(class_names)) {
+
+    TP <- cm[i, i]
+    FP <- sum(cm[i, ]) - TP
+    FN <- sum(cm[, i]) - TP
+
+    precision[i] <- ifelse(
+      TP + FP == 0,
+      0,
+      TP / (TP + FP)
+    )
+
+    recall[i] <- ifelse(
+      TP + FN == 0,
+      0,
+      TP / (TP + FN)
+    )
+
+    f1[i] <- ifelse(
+      precision[i] + recall[i] == 0,
+      0,
+      2 * precision[i] * recall[i] /
+        (precision[i] + recall[i])
+    )
+  }
+
+  metrics <- data.frame(
+    Accuracy = accuracy,
+    Macro_Precision = mean(precision),
+    Macro_Recall = mean(recall),
+    Macro_F1 = mean(f1),
+    Balanced_Accuracy = mean(recall)
+  )
+
+  list(
+    confusion_matrix = cm,
+    metrics = metrics
+  )
+}
+```
+
+## k-nearest neighbors (kNN)
+
+### Model description
+
+The kNN classifier assigns a class to an observation according to the majority class among its \(k\) nearest training observations.
+
+Distance is sensitive to scale, so predictors are standardized using the training-set means and standard deviations. The same scaling parameters are applied to validation and test observations.
+
+### Cross-validation and selection of k
+
+The candidate values of \(k\) are 3, 5, 7, 9, 11, 15, and 21, subject to the available training sample size.
+
+Five-fold stratified cross-validation is used to select the value of \(k\) with the highest mean Macro-F1 score.
+
+```{r knn-cross-validation}
+make_folds <- function(y, v = 5) {
+
+  folds <- vector("list", v)
+
+  for (class_name in levels(y)) {
+
+    idx <- sample(which(y == class_name))
+
+    if (length(idx) < v) {
+      stop(
+        "At least 5 observations per class are needed for 5-fold CV."
+      )
+    }
+
+    split_idx <- split(
+      idx,
+      rep(seq_len(v), length.out = length(idx))
+    )
+
+    for (j in seq_len(v)) {
+      folds[[j]] <- c(folds[[j]], split_idx[[j]])
+    }
+  }
+
+  folds
+}
+
+set.seed(123)
+
+folds <- make_folds(y_train, v = 5)
+
+k_candidates <- c(3, 5, 7, 9, 11, 15, 21)
+
+min_fold_train <- min(
+  sapply(folds, function(valid_idx) {
+    nrow(x_train) - length(valid_idx)
+  })
+)
+
+k_candidates <- k_candidates[
+  k_candidates < min_fold_train
+]
+
+cv_results <- data.frame()
+
+for (k in k_candidates) {
+
+  fold_f1 <- numeric(length(folds))
+
+  for (i in seq_along(folds)) {
+
+    valid_idx <- folds[[i]]
+
+    train_idx <- setdiff(
+      seq_len(nrow(x_train)),
+      valid_idx
+    )
+
+    x_tr <- x_train[train_idx, , drop = FALSE]
+    x_val <- x_train[valid_idx, , drop = FALSE]
+
+    y_tr <- y_train[train_idx]
+    y_val <- y_train[valid_idx]
+
+    imp <- impute_median(x_tr, x_val)
+
+    x_tr <- imp$train
+    x_val <- imp$new
+
+    train_mean <- sapply(x_tr, mean)
+    train_sd <- sapply(x_tr, sd)
+
+    train_sd[
+      !is.finite(train_sd) | train_sd == 0
+    ] <- 1
+
+    x_tr_scaled <- scale(
+      x_tr,
+      center = train_mean,
+      scale = train_sd
+    )
+
+    x_val_scaled <- scale(
+      x_val,
+      center = train_mean,
+      scale = train_sd
+    )
+
+    pred <- class::knn(
+      train = x_tr_scaled,
+      test = x_val_scaled,
+      cl = y_tr,
+      k = k
+    )
+
+    result <- evaluate_model(pred, y_val)
+
+    fold_f1[i] <- result$metrics$Macro_F1
+  }
+
+  cv_results <- rbind(
+    cv_results,
+    data.frame(
+      k = k,
+      Mean_Macro_F1 = mean(fold_f1)
+    )
+  )
+}
+
+print(cv_results)
+
+write.csv(
+  cv_results,
+  "output/knn_tuning.csv",
+  row.names = FALSE
+)
+```
+
+The cross-validation results are used to identify the optimal value of \(k\).
+
+```{r knn-best-k}
+best_k <- cv_results$k[
+  which.max(cv_results$Mean_Macro_F1)
+]
+
+cat("Best k:", best_k, "\n")
+```
+
+The selected value of \(k\) corresponds to the highest mean Macro-F1 score across the five validation folds.
+
+### Final kNN model
+
+The final kNN model is fitted using the complete training set and evaluated on the held-out test set.
+
+```{r knn-final-model}
+imp_knn <- impute_median(x_train, x_test)
+
+x_train_knn <- imp_knn$train
+x_test_knn <- imp_knn$new
+
+train_mean <- sapply(x_train_knn, mean)
+train_sd <- sapply(x_train_knn, sd)
+
+train_sd[
+  !is.finite(train_sd) | train_sd == 0
+] <- 1
+
+x_train_scaled <- scale(
+  x_train_knn,
+  center = train_mean,
+  scale = train_sd
+)
+
+x_test_scaled <- scale(
+  x_test_knn,
+  center = train_mean,
+  scale = train_sd
+)
+
+set.seed(123)
+
+knn_pred <- class::knn(
+  train = x_train_scaled,
+  test = x_test_scaled,
+  cl = y_train,
+  k = best_k
+)
+
+knn_result <- evaluate_model(knn_pred, y_test)
+
+cat("kNN Confusion Matrix:\n")
+print(knn_result$confusion_matrix)
+
+cat("\nkNN Performance:\n")
+print(knn_result$metrics)
+
+write.csv(
+  as.data.frame.matrix(knn_result$confusion_matrix),
+  "output/knn_confusion_matrix.csv"
+)
+```
+
+The confusion matrix shows the classification performance across the four BMI categories. The performance metrics provide an overall assessment of the model on the independent test set.
+
+## Classification tree
+
+### Model description
+
+A classification tree recursively partitions the predictor space into subsets to improve class separation.
+
+Unlike kNN, a classification tree does not rely on distance calculations. Its decision rules can also provide a more interpretable representation of how predictors are used to classify BMI categories.
+
+### Fit the original classification tree
+
+The original tree is fitted using the training data.
+
+```{r tree-fit}
+imp_tree <- impute_median(x_train, x_test)
+
+x_train_tree <- imp_tree$train
+x_test_tree <- imp_tree$new
+
+tree_train <- data.frame(
+  BMI_category = y_train,
+  x_train_tree
+)
+
+tree_test <- x_test_tree
+
+set.seed(123)
+
+tree_model <- tree::tree(
+  BMI_category ~ .,
+  data = tree_train
+)
+
+summary(tree_model)
+```
+
+The original tree is visualized below.
+
+```{r original-tree-plot, fig.cap="Original classification tree"}
+png(
+  "output/classification_tree_original.png",
+  width = 1200,
+  height = 900,
+  res = 120
+)
+
+if (nrow(tree_model$frame) == 1L) {
+
+  plot.new()
+  title("Original Classification Tree")
+  text(0.5, 0.5, "Single terminal node")
+
+} else {
+
+  plot(tree_model)
+  text(tree_model, pretty = 0, cex = 0.7)
+
+}
+
+dev.off()
+
+if (nrow(tree_model$frame) == 1L) {
+
+  plot.new()
+  title("Original Classification Tree")
+  text(0.5, 0.5, "Single terminal node")
+
+} else {
+
+  plot(tree_model)
+  text(tree_model, pretty = 0, cex = 0.7)
+
+}
+```
+
+### Cross-validation and pruning
+
+Ten-fold cross-validation with misclassification error is used to select the tree size for pruning.
+
+```{r tree-cross-validation}
+set.seed(123)
+
+cv_tree <- tree::cv.tree(
+  tree_model,
+  FUN = prune.tree,
+  K = 10,
+  method = "misclass"
+)
+
+print(cv_tree)
+```
+
+The tree size with the minimum cross-validation deviance is selected.
+
+```{r tree-pruning}
+best_size <- cv_tree$size[
+  which.min(cv_tree$dev)
+]
+
+cat("Best tree size:", best_size, "\n")
+
+tree_pruned <- tree::prune.tree(
+  tree_model,
+  best = best_size,
+  method = "misclass"
+)
+
+summary(tree_pruned)
+```
+
+The pruned tree is evaluated on the test set.
+
+If pruning produces a tree with only one terminal node, the model has no split and predicts the majority class of the training data for every test observation. This situation is handled explicitly rather than calling `predict()` on a single-node tree.
+
+### Original tree prediction
+
+The original tree is first evaluated for comparison.
+
+```{r tree-original-prediction}
+tree_pred_original <- predict(
+  tree_model,
+  newdata = tree_test,
+  type = "class"
+)
+
+tree_original_result <- evaluate_model(
+  tree_pred_original,
+  y_test
+)
+
+cat("Original Tree Confusion Matrix:\n")
+print(tree_original_result$confusion_matrix)
+
+cat("\nOriginal Tree Performance:\n")
+print(tree_original_result$metrics)
+```
+
+### Pruned tree prediction
+
+The following code checks whether pruning produced a single terminal node.
+
+```{r tree-pruned-prediction}
+is_single_node <- nrow(tree_pruned$frame) == 1L
+
+if (is_single_node) {
+
+  majority_class <- names(
+    which.max(table(y_train))
+  )
+
+  tree_pred_pruned <- factor(
+    rep(majority_class, nrow(tree_test)),
+    levels = levels(y_train)
+  )
+
+} else {
+
+  tree_pred_pruned <- predict(
+    tree_pruned,
+    newdata = tree_test,
+    type = "class"
+  )
+
+  tree_pred_pruned <- factor(
+    tree_pred_pruned,
+    levels = levels(y_train)
+  )
+}
+
+tree_pruned_result <- evaluate_model(
+  tree_pred_pruned,
+  y_test
+)
+
+cat("Pruned Tree Confusion Matrix:\n")
+print(tree_pruned_result$confusion_matrix)
+
+cat("\nPruned Tree Performance:\n")
+print(tree_pruned_result$metrics)
+```
+
+If the pruned tree contains only one terminal node, all test observations are assigned to the majority class of the training set. Otherwise, the regular prediction method is used.
+
+### Visualize the pruned tree
+
+```{r pruned-tree-plot, fig.cap="Pruned classification tree"}
+png(
+  "output/classification_tree_pruned.png",
+  width = 1200,
+  height = 900,
+  res = 120
+)
+
+if (is_single_node) {
+
+  plot.new()
+  title(main = "Pruned Classification Tree")
+
+  text(
+    x = 0.5,
+    y = 0.58,
+    labels = paste0(
+      "Single terminal node\n",
+      "Predicted class: ",
+      majority_class
+    ),
+    cex = 1.4
+  )
+
+} else {
+
+  plot(tree_pruned)
+  text(tree_pruned, pretty = 0, cex = 0.7)
+
+}
+
+dev.off()
+
+if (is_single_node) {
+
+  plot.new()
+  title(main = "Pruned Classification Tree")
+
+  text(
+    0.5,
+    0.58,
+    paste0(
+      "Single terminal node\n",
+      "Predicted class: ",
+      majority_class
+    ),
+    cex = 1.4
+  )
+
+} else {
+
+  plot(tree_pruned)
+  text(tree_pruned, pretty = 0, cex = 0.7)
+
+}
+```
+
+The pruned tree is compared with the original tree to examine how pruning affects model complexity and predictive performance.
+
+### Compare original and pruned trees
+
+```{r tree-comparison}
+tree_comparison <- rbind(
+  Original_Tree = tree_original_result$metrics,
+  Pruned_Tree = tree_pruned_result$metrics
+)
+
+print(tree_comparison)
+
+write.csv(
+  tree_comparison,
+  "output/tree_comparison.csv"
+)
+```
+
+Pruning reduces the complexity of a classification tree. However, excessive pruning may remove useful splits. A single-node pruned tree indicates that the cross-validation criterion favored a very simple model, but it also means that the pruned tree cannot distinguish among the outcome categories beyond predicting the majority class.
+
+# Model comparison
+
+The final kNN and pruned classification tree are compared using the same test dataset.
+
+The comparison includes Accuracy, Macro-precision, Macro-recall, Macro-F1, and Balanced Accuracy.
+
+```{r model-comparison}
+model_comparison <- rbind(
+
+  data.frame(
+    Model = "kNN",
+    knn_result$metrics
+  ),
+
+  data.frame(
+    Model = "Classification Tree",
+    tree_pruned_result$metrics
+  )
+
+)
+
+print(model_comparison)
+
+write.csv(
+  model_comparison,
+  "output/model_comparison.csv",
+  row.names = FALSE
+)
+```
+
+Accuracy represents the overall proportion of correctly classified observations. However, it may be influenced by differences in class frequencies.
+
+Macro-F1 and Balanced Accuracy provide additional information about performance across individual BMI categories. These metrics are particularly useful when the outcome categories are not equally represented.
+
+The model comparison helps determine whether kNN or the pruned classification tree provides better predictive performance in this dataset.
+
+# Conclusion
+
+Among the 18 dietary predictors initially considered, five variables were retained for model construction: total fat, cholesterol, carbohydrate, thiamin (vitamin B1), and caffeine intake. Total fat, cholesterol, and carbohydrate intake showed statistically significant differences across BMI categories after Benjamini–Hochberg adjustment (FDR < 0.10). Thiamin and caffeine were additionally retained because fewer than five variables met the predefined FDR criterion. These findings suggest that some dietary intake characteristics differed across BMI categories in the training data. However, they should not be interpreted as evidence of causal relationships.
+
+Regarding predictive performance, the kNN model achieved its highest cross-validation Macro-F1 score when (k=7). On the independent test set, it achieved an accuracy of 31.19% and a Macro-F1 score of 0.239. The original classification tree achieved an accuracy of 37.13% and a Macro-F1 score of 0.204. After pruning, the tree was reduced to a single terminal node and predicted every test observation as Normal. Although its accuracy increased to 41.58%, its Macro-F1 decreased to 0.147. This indicates that the higher accuracy of the pruned tree was largely attributable to predicting the most common category, rather than successfully distinguishing among all four BMI categories.
+
+Overall, kNN provided better performance than the pruned classification tree in terms of Macro-F1, suggesting a relatively better balance across the four outcome categories. Nevertheless, its Macro-F1 of 0.239 and balanced accuracy of 0.244 indicate that its ability to distinguish BMI categories remained limited. Neither model demonstrated satisfactory classification performance using the selected dietary predictors alone.
+
+Several factors may have contributed to these results. Dietary intake was measured using a single-day recall, which may not adequately represent participants' usual dietary patterns. In addition, BMI categories were defined using fixed cut points rather than age- and sex-specific BMI-for-age percentiles. Other relevant factors, including physical activity, socioeconomic conditions, sleep, and pubertal development, were not included in the models. The analysis also did not account for the complex NHANES survey design.
+
+In conclusion, although several dietary variables showed differences across BMI categories, the selected dietary predictors alone were insufficient for accurately classifying adolescent BMI status in this dataset. Future analyses could incorporate repeated dietary measurements, age- and sex-specific BMI classifications, and additional behavioral and demographic variables. More comprehensive feature selection and model validation procedures may also help determine whether combining dietary information with other relevant factors can improve classification performance.
+
+# AI use disclosure
+
+Generative AI (ChatGPT) was used to assist with English variable naming, R Markdown document organization, code editing, and the drafting of explanations of the analytical workflow and its limitations.
+
+The data processing, model execution, and interpretation of the resulting output should be checked by the author.
+
+The conversation documenting the AI assistance is available at:
+
+[ChatGPT conversation record](https://chatgpt.com/share/6afc7aa5-4644-83e8-95fb-6ae99087c1aa)
+
+# Reproducibility and output files
+
+The analysis generates the following output files in the `output` folder:
+
+- `BMI_distribution.csv`
+- `feature_variance.csv`
+- `feature_selection_kruskal.csv`
+- `selected_features.csv`
+- `feature_selection_correlation.csv`
+- `knn_tuning.csv`
+- `knn_confusion_matrix.csv`
+- `tree_comparison.csv`
+- `classification_tree_original.png`
+- `classification_tree_pruned.png`
+- `model_comparison.csv`
+
+The following code lists the generated output files.
+
+```{r output-files}
+cat("Analysis completed successfully!\n\n")
+
+cat("Output files:\n")
+print(list.files("output"))
+```
